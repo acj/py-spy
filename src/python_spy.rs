@@ -7,17 +7,14 @@ use std::slice;
 use std::path::Path;
 #[cfg(all(target_os="linux", unwind))]
 use std::iter::FromIterator;
-use regex::Regex;
-#[cfg(windows)]
-use regex::RegexBuilder;
 
 use anyhow::{format_err, Context, Error};
 use lazy_static::lazy_static;
 use remoteprocess::{Process, ProcessMemory, Pid, Tid};
-use proc_maps::{get_process_maps, MapRange};
+use proc_maps::MapRange;
+use spytools::binary_parser::BinaryInfo;
+use spytools::ProcessInfo;
 
-
-use crate::binary_parser::{parse_binary, BinaryInfo};
 use crate::config::{Config, LockingStrategy, LineNo};
 #[cfg(unwind)]
 use crate::native_stack_trace::NativeStack;
@@ -72,7 +69,7 @@ impl PythonSpy {
             .context("Failed to open process - check if it is running.")?;
 
         // get basic process information (memory maps/symbols etc)
-        let python_info = PythonProcessInfo::new(&process)?;
+        let python_info = ProcessInfo::new::<spytools::process::PythonProcessType>(&process)?;
 
         // lock the process when loading up on freebsd (rather than locking
         // on every memory read). Needs done after getting python process info
@@ -124,13 +121,13 @@ impl PythonSpy {
 
         #[cfg(unwind)]
         let native = if config.native {
-            Some(NativeStack::new(pid, python_info.python_binary, python_info.libpython_binary)?)
+            Some(NativeStack::new(pid, python_info.binary, python_info.library)?)
         } else {
             None
         };
 
         Ok(PythonSpy{pid, process, version, interpreter_address, threadstate_address,
-                     python_filename: python_info.python_filename,
+                     python_filename: python_info.path,
                      version_string,
                      #[cfg(unwind)]
                      native,
@@ -522,7 +519,7 @@ impl PythonSpy {
     }
 }
 /// Returns the version of python running in the process.
-fn get_python_version(python_info: &PythonProcessInfo, process: &remoteprocess::Process)
+fn get_python_version(python_info: &ProcessInfo, process: &remoteprocess::Process)
         -> Result<Version, Error> {
     // If possible, grab the sys.version string from the processes memory (mac osx).
     if let Some(&addr) = python_info.get_symbol("Py_GetVersion.version") {
@@ -535,7 +532,7 @@ fn get_python_version(python_info: &PythonProcessInfo, process: &remoteprocess::
     }
 
     // otherwise get version info from scanning BSS section for sys.version string
-    if let Some(ref pb) = python_info.python_binary {
+    if let Some(ref pb) = python_info.binary {
         info!("Getting version from python binary BSS");
         let bss = process.copy(pb.bss_addr as usize,
                                pb.bss_size as usize)?;
@@ -546,7 +543,7 @@ fn get_python_version(python_info: &PythonProcessInfo, process: &remoteprocess::
     }
 
     // try again if there is a libpython.so
-    if let Some(ref libpython) = python_info.libpython_binary {
+    if let Some(ref libpython) = python_info.library {
         info!("Getting version from libpython BSS");
         let bss = process.copy(libpython.bss_addr as usize,
                                libpython.bss_size as usize)?;
@@ -558,8 +555,8 @@ fn get_python_version(python_info: &PythonProcessInfo, process: &remoteprocess::
 
     // the python_filename might have the version encoded in it (/usr/bin/python3.5 etc).
     // try reading that in (will miss patch level on python, but that shouldn't matter)
-    info!("Trying to get version from path: {}", python_info.python_filename.display());
-    let path = Path::new(&python_info.python_filename);
+    info!("Trying to get version from path: {}", python_info.path.display());
+    let path = Path::new(&python_info.path);
     if let Some(python) = path.file_name() {
         if let Some(python) = python.to_str() {
             if python.starts_with("python") {
@@ -575,7 +572,7 @@ fn get_python_version(python_info: &PythonProcessInfo, process: &remoteprocess::
     Err(format_err!("Failed to find python version from target process"))
 }
 
-fn get_interpreter_address(python_info: &PythonProcessInfo,
+fn get_interpreter_address(python_info: &ProcessInfo,
                            process: &remoteprocess::Process,
                            version: &Version) -> Result<usize, Error> {
     // get the address of the main PyInterpreterState object from loaded symbols if we can
@@ -606,7 +603,7 @@ fn get_interpreter_address(python_info: &PythonProcessInfo,
 
     // try scanning the BSS section of the binary for things that might be the interpreterstate
     let err =
-        if let Some(ref pb) = python_info.python_binary {
+        if let Some(ref pb) = python_info.binary {
             match get_interpreter_address_from_binary(pb, &python_info.maps, process, version) {
                 Ok(addr) => return Ok(addr),
                 err => Some(err)
@@ -615,7 +612,7 @@ fn get_interpreter_address(python_info: &PythonProcessInfo,
             None
         };
     // Before giving up, try again if there is a libpython.so
-    if let Some(ref lpb) = python_info.libpython_binary {
+    if let Some(ref lpb) = python_info.library {
         info!("Failed to get interpreter from binary BSS, scanning libpython BSS");
         match get_interpreter_address_from_binary(lpb, &python_info.maps, process, version) {
             Ok(addr) => return Ok(addr),
@@ -705,337 +702,5 @@ fn check_interpreter_addresses(addrs: &[usize],
         Version{major: 3, minor: 9, ..} => check::<v3_9_5::_is>(addrs, maps, process),
         Version{major: 3, minor: 10, ..} => check::<v3_10_0::_is>(addrs, maps, process),
         _ => Err(format_err!("Unsupported version of Python: {}", version))
-    }
-}
-
-/// Holds information about the python process: memory map layout, parsed binary info
-/// for python /libpython etc.
-pub struct PythonProcessInfo {
-    python_binary: Option<BinaryInfo>,
-    // if python was compiled with './configure --enabled-shared', code/symbols will
-    // be in a libpython.so file instead of the executable. support that.
-    libpython_binary: Option<BinaryInfo>,
-    maps: Vec<MapRange>,
-    python_filename: std::path::PathBuf,
-    #[cfg(target_os="linux")]
-    dockerized: bool,
-}
-
-impl PythonProcessInfo {
-    fn new(process: &remoteprocess::Process) -> Result<PythonProcessInfo, Error> {
-        let filename = process.exe()
-            .context("Failed to get process executable name. Check that the process is running.")?;
-
-        #[cfg(windows)]
-        let filename = filename.to_lowercase();
-
-        #[cfg(windows)]
-        let is_python_bin = |pathname: &str| pathname.to_lowercase() == filename;
-
-        #[cfg(not(windows))]
-        let is_python_bin = |pathname: &str| pathname == filename;
-
-        // get virtual memory layout
-        let maps = get_process_maps(process.pid)?;
-        info!("Got virtual memory maps from pid {}:", process.pid);
-        for map in &maps {
-            debug!("map: {:016x}-{:016x} {}{}{} {}", map.start(), map.start() + map.size(),
-                if map.is_read() {'r'} else {'-'}, if map.is_write() {'w'} else {'-'}, if map.is_exec() {'x'} else {'-'},
-                map.filename().unwrap_or(&std::path::PathBuf::from("")).display());
-        }
-
-        // parse the main python binary
-        let (python_binary, python_filename) = {
-            // Get the memory address for the executable by matching against virtual memory maps
-            let map = maps.iter()
-                .find(|m| {
-                    if let Some(pathname) = m.filename() {
-                        if let Some(pathname) = pathname.to_str() {
-                            return is_python_bin(pathname) && m.is_exec();
-                        }
-                    }
-                    false
-                });
-
-            let map = match map {
-                Some(map) => map,
-                None => {
-                    warn!("Failed to find '{}' in virtual memory maps, falling back to first map region", filename);
-                    // If we failed to find the executable in the virtual memory maps, just take the first file we find
-                    // sometimes on windows get_process_exe returns stale info =( https://github.com/benfred/py-spy/issues/40
-                    // and on all operating systems I've tried, the exe is the first region in the maps
-                    &maps[0]
-                }
-            };
-
-            let filename = std::path::PathBuf::from(filename);
-
-            // TODO: consistent types? u64 -> usize? for map.start etc
-            #[allow(unused_mut)]
-            let python_binary = parse_binary(process.pid, &filename, map.start() as u64, map.size() as u64, true)
-                .and_then(|mut pb| {
-                    // windows symbols are stored in separate files (.pdb), load
-                    #[cfg(windows)]
-                    {
-                        get_windows_python_symbols(process.pid, &filename, map.start() as u64)
-                            .map(|symbols| { pb.symbols.extend(symbols); pb })
-                            .map_err(|err| err.into())
-                    }
-
-                    // For OSX, need to adjust main binary symbols by subtracting _mh_execute_header
-                    // (which we've added to by map.start already, so undo that here)
-                    #[cfg(target_os = "macos")]
-                    {
-                        let offset = pb.symbols["_mh_execute_header"] - map.start() as u64;
-                        for address in pb.symbols.values_mut() {
-                            *address -= offset;
-                        }
-
-                        if pb.bss_addr != 0 {
-                            pb.bss_addr -= offset;
-                        }
-                    }
-
-                    #[cfg(not(windows))]
-                    Ok(pb)
-                });
-
-            (python_binary, filename.clone())
-        };
-
-        // likewise handle libpython for python versions compiled with --enabled-shared
-        let libpython_binary = {
-            let libmap = maps.iter()
-                .find(|m| {
-                    if let Some(pathname) = m.filename() {
-                        if let Some(pathname) = pathname.to_str() {
-                            return is_python_lib(pathname) && m.is_exec();
-                        }
-                    }
-                    false
-                });
-
-            let mut libpython_binary: Option<BinaryInfo> = None;
-            if let Some(libpython) = libmap {
-                if let Some(filename) = &libpython.filename() {
-                    info!("Found libpython binary @ {}", filename.display());
-                    #[allow(unused_mut)]
-                    let mut parsed = parse_binary(process.pid, filename, libpython.start() as u64, libpython.size() as u64, false)?;
-                    #[cfg(windows)]
-                    parsed.symbols.extend(get_windows_python_symbols(process.pid, filename, libpython.start() as u64)?);
-                    libpython_binary = Some(parsed);
-                }
-            }
-
-            // On OSX, it's possible that the Python library is a dylib loaded up from the system
-            // framework (like /System/Library/Frameworks/Python.framework/Versions/2.7/Python)
-            // In this case read in the dyld_info information and figure out the filename from there
-            #[cfg(target_os = "macos")]
-            {
-                if libpython_binary.is_none() {
-                    use proc_maps::mac_maps::get_dyld_info;
-                    let dyld_infos = get_dyld_info(process.pid)?;
-
-                    for dyld in &dyld_infos {
-                        let segname = unsafe { std::ffi::CStr::from_ptr(dyld.segment.segname.as_ptr()) };
-                        debug!("dyld: {:016x}-{:016x} {:10} {}",
-                            dyld.segment.vmaddr, dyld.segment.vmaddr + dyld.segment.vmsize,
-                            segname.to_string_lossy(), dyld.filename.display());
-                    }
-
-                    let python_dyld_data = dyld_infos.iter()
-                        .find(|m| {
-                            if let Some(filename) = m.filename.to_str() {
-                                return is_python_framework(filename) &&
-                                      m.segment.segname[0..7] == [95, 95, 68, 65, 84, 65, 0];
-                            }
-                            false
-                        });
-
-
-                    if let Some(libpython) = python_dyld_data {
-                        info!("Found libpython binary from dyld @ {}", libpython.filename.display());
-
-                        let mut binary = parse_binary(process.pid, &libpython.filename, libpython.segment.vmaddr, libpython.segment.vmsize, false)?;
-
-                        // TODO: bss addr offsets returned from parsing binary are wrong
-                        // (assumes data section isn't split from text section like done here).
-                        // BSS occurs somewhere in the data section, just scan that
-                        // (could later tighten this up to look at segment sections too)
-                        binary.bss_addr = libpython.segment.vmaddr;
-                        binary.bss_size = libpython.segment.vmsize;
-                        libpython_binary = Some(binary);
-                    }
-                }
-            }
-
-            libpython_binary
-        };
-
-        // If we have a libpython binary - we can tolerate failures on parsing the main python binary.
-        let python_binary = match libpython_binary {
-            None => Some(python_binary.context("Failed to parse python binary")?),
-            _ => python_binary.ok(),
-        };
-
-        #[cfg(target_os="linux")]
-        let dockerized = is_dockerized(process.pid).unwrap_or(false);
-
-        Ok(PythonProcessInfo{python_binary, libpython_binary, maps, python_filename,
-                             #[cfg(target_os="linux")]
-                             dockerized
-        })
-    }
-
-    pub fn get_symbol(&self, symbol: &str) -> Option<&u64> {
-        if let Some(ref pb) = self.python_binary {
-            if let Some(addr) = pb.symbols.get(symbol) {
-                info!("got symbol {} (0x{:016x}) from python binary", symbol, addr);
-                return Some(addr);
-            }
-        }
-
-        if let Some(ref binary) = self.libpython_binary {
-            if let Some(addr) = binary.symbols.get(symbol) {
-                info!("got symbol {} (0x{:016x}) from libpython binary", symbol, addr);
-                return Some(addr);
-            }
-        }
-        None
-    }
-}
-
-#[cfg(target_os="linux")]
-fn is_dockerized(pid: Pid) -> Result<bool, Error> {
-    let self_mnt = std::fs::read_link("/proc/self/ns/mnt")?;
-    let target_mnt = std::fs::read_link(&format!("/proc/{}/ns/mnt", pid))?;
-    Ok(self_mnt != target_mnt)
-}
-
-// We can't use goblin to parse external symbol files (like in a separate .pdb file) on windows,
-// So use the win32 api to load up the couple of symbols we need on windows. Note:
-// we still can get export's from the PE file
-#[cfg(windows)]
-pub fn get_windows_python_symbols(pid: Pid, filename: &Path, offset: u64) -> std::io::Result<HashMap<String, u64>> {
-    use proc_maps::win_maps::SymbolLoader;
-
-    let handler = SymbolLoader::new(pid)?;
-    let _module = handler.load_module(filename)?; // need to keep this module in scope
-
-    let mut ret = HashMap::new();
-
-    // currently we only need a subset of symbols, and enumerating the symbols is
-    // expensive (via SymEnumSymbolsW), so rather than load up all symbols like we
-    // do for goblin, just load the the couple we need directly.
-    for symbol in ["_PyThreadState_Current", "interp_head", "_PyRuntime"].iter() {
-        if let Ok((base, addr)) = handler.address_from_name(symbol) {
-            // If we have a module base (ie from PDB), need to adjust by the offset
-            // otherwise seems like we can take address directly
-            let addr = if base == 0 { addr } else { offset + addr - base };
-            ret.insert(String::from(*symbol), addr);
-        }
-    }
-
-    Ok(ret)
-}
-
-#[cfg(any(target_os="linux", target_os="freebsd"))]
-pub fn is_python_lib(pathname: &str) -> bool {
-    lazy_static! {
-        static ref RE: Regex = Regex::new(r"/libpython\d.\d\d?(m|d|u)?.so").unwrap();
-    }
-    RE.is_match(pathname)
-}
-
-#[cfg(target_os="macos")]
-pub fn is_python_lib(pathname: &str) -> bool {
-    lazy_static! {
-        static ref RE: Regex = Regex::new(r"/libpython\d.\d\d?(m|d|u)?.(dylib|so)$").unwrap();
-    }
-    RE.is_match(pathname) || is_python_framework(pathname)
-}
-
-#[cfg(windows)]
-pub fn is_python_lib(pathname: &str) -> bool {
-    lazy_static! {
-        static ref RE: Regex = RegexBuilder::new(r"\\python\d\d\d?(m|d|u)?.dll$").case_insensitive(true).build().unwrap();
-    }
-    RE.is_match(pathname)
-}
-
-#[cfg(target_os="macos")]
-pub fn is_python_framework(pathname: &str) -> bool {
-    pathname.ends_with("/Python")  &&
-    !pathname.contains("Python.app")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[cfg(target_os="macos")]
-    #[test]
-    fn test_is_python_lib() {
-        assert!(is_python_lib("~/Anaconda2/lib/libpython2.7.dylib"));
-
-        // python lib configured with --with-pydebug (flag: d)
-        assert!(is_python_lib("/lib/libpython3.4d.dylib"));
-
-        // configured --with-pymalloc (flag: m)
-        assert!(is_python_lib("/usr/local/lib/libpython3.8m.dylib"));
-
-        // python2 configured with --with-wide-unicode (flag: u)
-        assert!(is_python_lib("./libpython2.7u.dylib"));
-
-        assert!(!is_python_lib("/libboost_python.dylib"));
-        assert!(!is_python_lib("/lib/heapq.cpython-36m-darwin.dylib"));
-    }
-
-    #[cfg(any(target_os="linux", target_os="freebsd"))]
-    #[test]
-    fn test_is_python_lib() {
-        // libpython bundled by pyinstaller https://github.com/benfred/py-spy/issues/42
-        assert!(is_python_lib("/tmp/_MEIOqzg01/libpython2.7.so.1.0"));
-
-        // test debug/malloc/unicode flags
-        assert!(is_python_lib("./libpython2.7.so"));
-        assert!(is_python_lib("/usr/lib/libpython3.4d.so"));
-        assert!(is_python_lib("/usr/local/lib/libpython3.8m.so"));
-        assert!(is_python_lib("/usr/lib/libpython2.7u.so"));
-
-        // don't blindly match libraries with python in the name (boost_python etc)
-        assert!(!is_python_lib("/usr/lib/libboost_python.so"));
-        assert!(!is_python_lib("/usr/lib/x86_64-linux-gnu/libboost_python-py27.so.1.58.0"));
-        assert!(!is_python_lib("/usr/lib/libboost_python-py35.so"));
-
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn test_is_python_lib() {
-        assert!(is_python_lib("C:\\Users\\test\\AppData\\Local\\Programs\\Python\\Python37\\python37.dll"));
-        // .NET host via https://github.com/pythonnet/pythonnet
-        assert!(is_python_lib("C:\\Users\\test\\AppData\\Local\\Programs\\Python\\Python37\\python37.DLL"));
-    }
-
-
-    #[cfg(target_os="macos")]
-    #[test]
-    fn test_python_frameworks() {
-        // homebrew v2
-        assert!(!is_python_framework("/usr/local/Cellar/python@2/2.7.15_1/Frameworks/Python.framework/Versions/2.7/Resources/Python.app/Contents/MacOS/Python"));
-        assert!(is_python_framework("/usr/local/Cellar/python@2/2.7.15_1/Frameworks/Python.framework/Versions/2.7/Python"));
-
-        // System python from osx 10.13.6 (high sierra)
-        assert!(!is_python_framework("/System/Library/Frameworks/Python.framework/Versions/2.7/Resources/Python.app/Contents/MacOS/Python"));
-        assert!(is_python_framework("/System/Library/Frameworks/Python.framework/Versions/2.7/Python"));
-
-        // pyenv 3.6.6 with OSX framework enabled (https://github.com/benfred/py-spy/issues/15)
-        // env PYTHON_CONFIGURE_OPTS="--enable-framework" pyenv install 3.6.6
-        assert!(is_python_framework("/Users/ben/.pyenv/versions/3.6.6/Python.framework/Versions/3.6/Python"));
-        assert!(!is_python_framework("/Users/ben/.pyenv/versions/3.6.6/Python.framework/Versions/3.6/Resources/Python.app/Contents/MacOS/Python"));
-
-        // single file pyinstaller
-        assert!(is_python_framework("/private/var/folders/3x/qy479lpd1fb2q88lc9g4d3kr0000gn/T/_MEI2Akvi8/Python"));
     }
 }

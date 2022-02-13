@@ -28,7 +28,6 @@
 extern crate log;
 
 pub mod config;
-pub mod binary_parser;
 #[cfg(unwind)]
 mod cython;
 #[cfg(unwind)]

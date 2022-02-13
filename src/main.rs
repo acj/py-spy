@@ -3,7 +3,6 @@ extern crate log;
 
 mod config;
 mod dump;
-mod binary_parser;
 #[cfg(unwind)]
 mod cython;
 #[cfg(unwind)]

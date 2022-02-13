@@ -578,6 +578,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "memmap2"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "057a3db23999c867821a7a59feb06a578fcb03685e983dff90daf9e7d24ac08f"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "memoffset"
 version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -796,6 +805,7 @@ dependencies = [
  "serde",
  "serde_derive",
  "serde_json",
+ "spytools",
  "tempfile",
  "termios",
  "winapi",
@@ -1025,6 +1035,22 @@ name = "smallvec"
 version = "1.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ecab6c735a6bb4139c0caafd0cc3635748bbb3acf4550e8138122099251f309"
+
+[[package]]
+name = "spytools"
+version = "0.1.0"
+source = "git+https://github.com/rbspy/spytools?branch=extract-from-pyspy#eddaf4d26e67543e39a61ba0619447f667e518da"
+dependencies = [
+ "anyhow",
+ "goblin",
+ "lazy_static",
+ "libc",
+ "log",
+ "memmap2",
+ "proc-maps",
+ "regex",
+ "remoteprocess",
+]
 
 [[package]]
 name = "stable_deref_trait"

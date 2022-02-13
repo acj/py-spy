@@ -1,12 +1,12 @@
 use std::collections::HashSet;
-use failure::Error;
+use anyhow::{format_err, Error};
 
 use cpp_demangle::{DemangleOptions, BorrowedSymbol};
 use remoteprocess::{self, Pid};
 use lazy_static::lazy_static;
 use lru::LruCache;
+use spytools::binary_parser::BinaryInfo;
 
-use crate::binary_parser::BinaryInfo;
 use crate::cython;
 use crate::stack_trace::{Frame};
 use crate::utils::resolve_filename;

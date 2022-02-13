@@ -1,10 +1,9 @@
+use anyhow::Error;
 use console::style;
-use failure::Error;
+use remoteprocess::Pid;
 
 use crate::config::Config;
 use crate::python_spy::PythonSpy;
-
-use remoteprocess::Pid;
 
 pub fn print_traces(pid: Pid, config: &Config) -> Result<(), Error> {
     let mut process = PythonSpy::new(pid, config)?;

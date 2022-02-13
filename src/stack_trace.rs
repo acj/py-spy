@@ -1,7 +1,7 @@
 use std;
 use std::sync::Arc;
 
-use failure::{Error, ResultExt};
+use anyhow::{format_err, Context, Error};
 
 use remoteprocess::{ProcessMemory, Pid, Process};
 use serde_derive::Serialize;
